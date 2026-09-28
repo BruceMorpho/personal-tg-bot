@@ -1,7 +1,4 @@
-# Demo TG Bot Link
-
-
-# https://t.me/teamxrelaybot
+# Demo TG Bot Link # https://t.me/teamxrelaybot
 
 
 # Telegram Anonymous Relay Bot (Vercel)
