@@ -11,6 +11,8 @@ Env vars (set in Vercel project settings):
 
 import logging
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 from flask import Flask, request
@@ -120,6 +122,7 @@ def register_user(msg: dict):
     handle = f" @{user['username']}" if user.get("username") else ""
     redis("SADD", "users", uid)
     redis("SET", f"uname:{uid}", f"{name}{handle}")
+    redis("SREM", "blocked", uid)  # they messaged us, so they are active again
 
 
 def label(uid) -> str:
@@ -198,9 +201,15 @@ def cmd_users(msg, args):
     if not ids:
         say(chat, "No users yet.")
         return
+    banned = set(redis("SMEMBERS", "banned") or [])
+    blocked = set(redis("SMEMBERS", "blocked") or [])
     lines = []
     for uid in ids:
-        mark = " [banned]" if is_banned(uid) else ""
+        mark = ""
+        if uid in banned:
+            mark = " [banned]"
+        elif uid in blocked:
+            mark = " [blocked bot]"
         lines.append(f"{label(uid)}{mark}")
     say(chat, f"Users ({len(lines)}):\n" + "\n".join(lines))
 
@@ -246,20 +255,35 @@ def cmd_broadcast(msg, args):
     if not source and len(parts) < 2:
         say(chat, "Usage: /broadcast <text>, or reply to any message with /broadcast.")
         return
-    ok = failed = 0
-    for uid in redis("SMEMBERS", "users") or []:
-        if is_banned(uid):
-            continue
-        if source:
-            res = tg("copyMessage", chat_id=int(uid), from_chat_id=chat,
-                     message_id=source["message_id"])
-        else:
-            res = tg("sendMessage", chat_id=int(uid), text=parts[1])
-        if res.get("ok"):
-            ok += 1
-        else:
-            failed += 1
-    say(chat, f"Broadcast done. Sent: {ok}, failed: {failed}.")
+
+    # Fetch both sets once (instead of one Redis call per user)
+    users = set(redis("SMEMBERS", "users") or [])
+    banned = set(redis("SMEMBERS", "banned") or [])
+    targets = list(users - banned)
+
+    def send(uid):
+        for _ in range(3):
+            if source:
+                res = tg("copyMessage", chat_id=int(uid), from_chat_id=chat,
+                         message_id=source["message_id"])
+            else:
+                res = tg("sendMessage", chat_id=int(uid), text=parts[1])
+            if res.get("ok"):
+                return True
+            code = res.get("error_code")
+            if code == 429:  # rate limited: wait and retry
+                time.sleep(res.get("parameters", {}).get("retry_after", 1))
+                continue
+            if code == 403:  # user blocked the bot: only MARK, never delete
+                redis("SADD", "blocked", uid)
+            return False
+        return False
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        results = list(ex.map(send, targets))
+
+    ok = sum(1 for r in results if r)
+    say(chat, f"Broadcast done. Sent: {ok}, failed: {len(results) - ok}.")
 
 
 def cmd_delete(msg, args):
@@ -341,8 +365,14 @@ def webhook(path):
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         return "forbidden", 403
 
+    update = request.get_json(force=True, silent=True) or {}
+
+    # Skip duplicate updates (Telegram retries when a response is slow)
+    update_id = update.get("update_id")
+    if update_id and redis("SET", f"upd:{update_id}", "1", "NX", "EX", 86400) != "OK":
+        return "ok", 200
+
     try:
-        update = request.get_json(force=True, silent=True) or {}
         msg = update.get("message")
         if msg and msg["chat"]["type"] == "private":
             if msg["chat"]["id"] == OWNER_ID:
@@ -354,4 +384,3 @@ def webhook(path):
 
     # Always return 200 so Telegram doesn't keep retrying a failing update
     return "ok", 200
-
