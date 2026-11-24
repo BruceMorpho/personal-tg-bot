@@ -1,5 +1,6 @@
 """
 Anonymous relay bot - Vercel (serverless webhook) version.
++ Payment flow (QR, screenshot, channel link) with owner-editable settings.
 
 Env vars (set in Vercel project settings):
     BOT_TOKEN        token from @BotFather
@@ -11,6 +12,7 @@ Env vars (set in Vercel project settings):
 
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -43,7 +45,9 @@ OWNER_HELP = (
     "/unban - unban user\n"
     "/bans - banned list\n"
     "/broadcast - message everyone\n"
-    "/delete - (reply to your sent message) delete it from the user's chat"
+    "/delete - (reply to your sent message) delete it from the user's chat\n"
+    "/pay - edit offer, UPI ID, QR, channel link\n"
+    "/cancelpay - cancel a pending payment edit"
 )
 
 OWNER_COMMANDS = [
@@ -53,6 +57,8 @@ OWNER_COMMANDS = [
     {"command": "bans", "description": "Banned list"},
     {"command": "broadcast", "description": "Message everyone"},
     {"command": "delete", "description": "Delete a sent message from user's chat"},
+    {"command": "pay", "description": "Payment settings"},
+    {"command": "cancelpay", "description": "Cancel a payment edit"},
 ]
 
 app = Flask(__name__)
@@ -129,6 +135,127 @@ def label(uid) -> str:
     return f"{redis('GET', f'uname:{uid}') or 'Unknown'} ({uid})"
 
 
+# ---------- payment flow ----------
+# Everything the owner can edit lives in Redis under cfg:<key>, so changing the
+# offer, UPI ID, QR or channel link never needs a redeploy.
+PAY_DEFAULTS = {
+    "hi": "Hi! Do you want a subscription?\nReply: I want subscription",
+    "offer": "Monthly Rs 199, Yearly Rs 1499",
+    "upi": "",
+    "qr": "",
+    "link": "",
+}
+
+SET_PROMPTS = {
+    "hi": "Send the new greeting text.",
+    "offer": "Send the new offer text.",
+    "upi": "Send the new UPI ID.",
+    "qr": "Send the new QR as a photo.",
+    "link": "Send the new channel link.",
+}
+
+TXT_ASK_SS = (
+    "After payment, share the screenshot here.\n"
+    "Admin will check your payment and send you the channel link."
+)
+TXT_PAY_WAITING = (
+    "Payment screenshot received. Admin will check your payment "
+    "and add you or send you the channel link shortly."
+)
+TXT_REJECTED = "We couldn't find your payment. Please send a clear screenshot again."
+
+PAYFLOW_TTL = 60 * 60 * 24  # how long we wait for a screenshot after "I want to pay"
+KEYWORD_MAX_LEN = 60        # longer messages are never treated as keywords
+
+RE_PAY = re.compile(r"\b(pay|payment)\b", re.I)
+RE_SUB = re.compile(r"\b(subscription|subscribe|plan)\b", re.I)
+RE_HI = re.compile(r"\b(hi|hello|hey|vanakkam)\b", re.I)
+
+
+def cfg(key: str) -> str:
+    return redis("GET", f"cfg:{key}") or PAY_DEFAULTS[key]
+
+
+def set_cfg(key: str, value: str):
+    redis("SET", f"cfg:{key}", value)
+
+
+def has_image(msg: dict) -> bool:
+    doc = msg.get("document") or {}
+    return bool(msg.get("photo")) or str(doc.get("mime_type", "")).startswith("image/")
+
+
+def sender_label(msg: dict) -> str:
+    user = msg.get("from", {})
+    name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Unknown"
+    handle = f" (@{user['username']})" if user.get("username") else ""
+    return f"{name}{handle}\nID: {user.get('id') or msg['chat']['id']}"
+
+
+def send_screenshot_to_owner(msg: dict) -> bool:
+    chat_id = msg["chat"]["id"]
+    copied = tg("copyMessage", chat_id=OWNER_ID, from_chat_id=chat_id,
+                message_id=msg["message_id"])
+    if not copied.get("ok"):
+        return False
+    header = tg(
+        "sendMessage",
+        chat_id=OWNER_ID,
+        text=f"💰 Payment screenshot\nFrom: {sender_label(msg)}",
+        reply_markup={"inline_keyboard": [
+            [{"text": "Send channel link", "callback_data": f"pay:link:{chat_id}"}],
+            [{"text": "Payment not received", "callback_data": f"pay:rej:{chat_id}"}],
+        ]},
+    )
+    # The owner can also use Telegram's Reply on either message to chat with them
+    for res in (copied, header):
+        if res.get("ok"):
+            save_route(res["result"]["message_id"], chat_id, msg["message_id"])
+    return True
+
+
+def handle_payment(msg: dict) -> bool:
+    """True when this message was handled by the payment flow (not relayed)."""
+    chat_id = msg["chat"]["id"]
+    text = (msg.get("text") or "").strip()
+
+    # Payment screenshot (only right after "I want to pay")
+    if has_image(msg):
+        if not redis("GET", f"payflow:{chat_id}"):
+            return False
+        if not send_screenshot_to_owner(msg):
+            return False
+        redis("DEL", f"payflow:{chat_id}")
+        say(chat_id, TXT_PAY_WAITING)
+        return True
+
+    if not text or len(text) > KEYWORD_MAX_LEN:
+        return False
+
+    if RE_PAY.search(text):
+        qr = redis("GET", "cfg:qr")
+        upi = redis("GET", "cfg:upi")  # empty until the owner sets it
+        if qr:
+            caption = f"Scan to pay: {upi}" if upi else "Scan to pay"
+            sent = tg("sendPhoto", chat_id=chat_id, photo=qr, caption=caption)
+        elif upi:
+            sent = tg("sendMessage", chat_id=chat_id, text=f"Pay to this UPI ID:\n{upi}")
+        else:
+            return False  # neither QR nor UPI set yet: relay to the owner as usual
+        if not sent.get("ok"):
+            return False
+        say(chat_id, TXT_ASK_SS)
+        redis("SET", f"payflow:{chat_id}", "1", "EX", PAYFLOW_TTL)
+        return True
+    if RE_SUB.search(text):
+        say(chat_id, f"Subscription details:\n{cfg('offer')}\nReply: I want to pay")
+        return True
+    if RE_HI.search(text):
+        say(chat_id, cfg("hi"))
+        return True
+    return False
+
+
 # ---------- logic ----------
 def handle_visitor(msg: dict):
     chat_id = msg["chat"]["id"]
@@ -144,6 +271,10 @@ def handle_visitor(msg: dict):
         return
 
     register_user(msg)
+
+    if handle_payment(msg):
+        return
+
     user = msg.get("from", {})
     name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Unknown"
     handle = f" (@{user['username']})" if user.get("username") else ""
@@ -302,6 +433,127 @@ def cmd_delete(msg, args):
         say(chat, f"Couldn't delete: {res.get('description', 'unknown error')}")
 
 
+def settings_text() -> str:
+    return (
+        "Current settings\n\n"
+        f"Greeting: {cfg('hi')}\n"
+        f"Offer: {cfg('offer')}\n"
+        f"UPI ID: {cfg('upi') or 'not set'}\n"
+        f"QR: {'set' if cfg('qr') else 'not set'}\n"
+        f"Channel link: {cfg('link') or 'not set'}"
+    )
+
+
+def cmd_pay(msg, args):
+    tg(
+        "sendMessage",
+        chat_id=msg["chat"]["id"],
+        text="Payment settings. Choose what to edit.",
+        reply_markup={"inline_keyboard": [
+            [{"text": "Edit offer", "callback_data": "set:offer"},
+             {"text": "Change UPI ID", "callback_data": "set:upi"}],
+            [{"text": "Change QR", "callback_data": "set:qr"},
+             {"text": "Channel link", "callback_data": "set:link"}],
+            [{"text": "Edit greeting", "callback_data": "set:hi"},
+             {"text": "Show settings", "callback_data": "set:show"}],
+        ]},
+    )
+
+
+def cmd_cancelpay(msg, args):
+    redis("DEL", "admin_state")
+    say(msg["chat"]["id"], "Cancelled.")
+
+
+def apply_admin_state(msg: dict, state: str) -> bool:
+    """Owner sent a plain message while an edit is pending. True if consumed."""
+    chat = msg["chat"]["id"]
+    if state not in SET_PROMPTS:
+        redis("DEL", "admin_state")
+        return False
+
+    if state == "qr":
+        doc = msg.get("document") or {}
+        if msg.get("photo"):
+            file_id = msg["photo"][-1]["file_id"]
+        elif str(doc.get("mime_type", "")).startswith("image/"):
+            file_id = doc["file_id"]
+        else:
+            say(chat, "Send the QR as a photo, or /cancelpay.")
+            return True
+        set_cfg("qr", file_id)
+        redis("DEL", "admin_state")
+        say(chat, "QR updated.")
+        return True
+
+    value = (msg.get("text") or "").strip()
+    if not value:
+        say(chat, "Send text, or /cancelpay.")
+        return True
+    set_cfg(state, value)
+    redis("DEL", "admin_state")
+    say(chat, "Updated. Customers see it now.")
+    return True
+
+
+def handle_callback(cb: dict):
+    """Inline button taps (owner only)."""
+    cb_id = cb["id"]
+    if cb.get("from", {}).get("id") != OWNER_ID:
+        tg("answerCallbackQuery", callback_query_id=cb_id, text="Not allowed.", show_alert=True)
+        return
+
+    data = cb.get("data") or ""
+    message = cb.get("message") or {}
+    chat = message.get("chat", {}).get("id", OWNER_ID)
+
+    if data.startswith("set:"):
+        action = data.split(":", 1)[1]
+        tg("answerCallbackQuery", callback_query_id=cb_id)
+        if action == "show":
+            say(chat, settings_text())
+        elif action in SET_PROMPTS:
+            redis("SET", "admin_state", action, "EX", 3600)
+            say(chat, SET_PROMPTS[action] + "\nSend /cancelpay to cancel.")
+        return
+
+    if data.startswith("pay:"):
+        try:
+            _, action, uid = data.split(":")
+            uid = int(uid)
+        except ValueError:
+            tg("answerCallbackQuery", callback_query_id=cb_id)
+            return
+
+        if action == "link":
+            link = cfg("link")
+            if not link:
+                tg("answerCallbackQuery", callback_query_id=cb_id,
+                   text="Set the channel link first: /pay", show_alert=True)
+                return
+            res = tg("sendMessage", chat_id=uid, text=f"Payment confirmed. Join here: {link}")
+            status = "Link sent"
+        else:
+            res = tg("sendMessage", chat_id=uid, text=TXT_REJECTED)
+            status = "Marked not received"
+            if res.get("ok"):
+                # let them send a fresh screenshot
+                redis("SET", f"payflow:{uid}", "1", "EX", PAYFLOW_TTL)
+
+        if not res.get("ok"):
+            tg("answerCallbackQuery", callback_query_id=cb_id,
+               text="Couldn't reach the user. They may have blocked the bot.", show_alert=True)
+            return
+
+        tg("answerCallbackQuery", callback_query_id=cb_id, text=status)
+        if message.get("message_id"):
+            tg("editMessageText", chat_id=chat, message_id=message["message_id"],
+               text=f"{message.get('text', '')}\n\nStatus: {status}")
+        return
+
+    tg("answerCallbackQuery", callback_query_id=cb_id)
+
+
 OWNER_CMDS = {
     "/start": owner_start,
     "/users": cmd_users,
@@ -310,6 +562,8 @@ OWNER_CMDS = {
     "/bans": cmd_bans,
     "/broadcast": cmd_broadcast,
     "/delete": cmd_delete,
+    "/pay": cmd_pay,
+    "/cancelpay": cmd_cancelpay,
 }
 
 
@@ -324,6 +578,12 @@ def handle_owner(msg: dict):
             handler(msg, parts[1:])
         return
 
+    # Pending payment-setting edit (offer / UPI / QR / link / greeting)
+    if not msg.get("reply_to_message"):
+        state = redis("GET", "admin_state")
+        if state and apply_admin_state(msg, state):
+            return
+
     replied = msg.get("reply_to_message")
     if not replied:
         tg("sendMessage", chat_id=owner_chat,
@@ -332,55 +592,4 @@ def handle_owner(msg: dict):
 
     route = get_route(replied["message_id"])
     if not route:
-        tg("sendMessage", chat_id=owner_chat,
-           text="I can't tell who that message came from. Reply to a relayed message.")
-        return
-
-    user_chat_id, user_msg_id = route
-    # copyMessage sends as the bot: no forward tag, nothing about the owner is exposed
-    res = tg(
-        "copyMessage",
-        chat_id=user_chat_id,
-        from_chat_id=owner_chat,
-        message_id=msg["message_id"],
-        reply_parameters={"message_id": user_msg_id, "allow_sending_without_reply": True},
-    )
-    if res.get("ok"):
-        redis("SET", f"sent:{msg['message_id']}",
-              f"{user_chat_id}:{res['result']['message_id']}", "EX", ROUTE_TTL)
-        reset_waiting(user_chat_id)  # next message from them gets the waiting notice again
-        tg("setMessageReaction", chat_id=owner_chat, message_id=msg["message_id"],
-           reaction=[{"type": "emoji", "emoji": "👍"}])
-    else:
-        tg("sendMessage", chat_id=owner_chat,
-           text=f"❌ Couldn't deliver: {res.get('description', 'unknown error')}")
-
-
-@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
-@app.route("/<path:path>", methods=["GET", "POST"])
-def webhook(path):
-    if request.method == "GET":
-        return "relay bot is running", 200
-
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-        return "forbidden", 403
-
-    update = request.get_json(force=True, silent=True) or {}
-
-    # Skip duplicate updates (Telegram retries when a response is slow)
-    update_id = update.get("update_id")
-    if update_id and redis("SET", f"upd:{update_id}", "1", "NX", "EX", 86400) != "OK":
-        return "ok", 200
-
-    try:
-        msg = update.get("message")
-        if msg and msg["chat"]["type"] == "private":
-            if msg["chat"]["id"] == OWNER_ID:
-                handle_owner(msg)
-            else:
-                handle_visitor(msg)
-    except Exception:
-        log.exception("Error handling update")
-
-    # Always return 200 so Telegram doesn't keep retrying a failing update
-    return "ok", 200
+        tg("sendMessage", chat_id=owner
