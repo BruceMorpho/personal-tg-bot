@@ -592,4 +592,60 @@ def handle_owner(msg: dict):
 
     route = get_route(replied["message_id"])
     if not route:
-        tg("sendMessage", chat_id=owner
+        tg("sendMessage", chat_id=owner_
+           chat,
+           text="I can't tell who that message came from. Reply to a relayed message.")
+        return
+
+    user_chat_id, user_msg_id = route
+    # copyMessage sends as the bot: no forward tag, nothing about the owner is exposed
+    res = tg(
+        "copyMessage",
+        chat_id=user_chat_id,
+        from_chat_id=owner_chat,
+        message_id=msg["message_id"],
+        reply_parameters={"message_id": user_msg_id, "allow_sending_without_reply": True},
+    )
+    if res.get("ok"):
+        redis("SET", f"sent:{msg['message_id']}",
+              f"{user_chat_id}:{res['result']['message_id']}", "EX", ROUTE_TTL)
+        reset_waiting(user_chat_id)  # next message from them gets the waiting notice again
+        tg("setMessageReaction", chat_id=owner_chat, message_id=msg["message_id"],
+           reaction=[{"type": "emoji", "emoji": "👍"}])
+    else:
+        tg("sendMessage", chat_id=owner_chat,
+           text=f"❌ Couldn't deliver: {res.get('description', 'unknown error')}")
+
+
+@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
+@app.route("/<path:path>", methods=["GET", "POST"])
+def webhook(path):
+    if request.method == "GET":
+        return "relay bot is running", 200
+
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        return "forbidden", 403
+
+    update = request.get_json(force=True, silent=True) or {}
+
+    # Skip duplicate updates (Telegram retries when a response is slow)
+    update_id = update.get("update_id")
+    if update_id and redis("SET", f"upd:{update_id}", "1", "NX", "EX", 86400) != "OK":
+        return "ok", 200
+
+    try:
+        cb = update.get("callback_query")
+        if cb:
+            handle_callback(cb)
+
+        msg = update.get("message")
+        if msg and msg["chat"]["type"] == "private":
+            if msg["chat"]["id"] == OWNER_ID:
+                handle_owner(msg)
+            else:
+                handle_visitor(msg)
+    except Exception:
+        log.exception("Error handling update")
+
+    # Always return 200 so Telegram doesn't keep retrying a failing update
+    return "ok", 200
