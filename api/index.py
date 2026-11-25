@@ -592,8 +592,7 @@ def handle_owner(msg: dict):
 
     route = get_route(replied["message_id"])
     if not route:
-        tg("sendMessage", chat_id=owner_
-           chat,
+        tg("sendMessage", chat_id=owner_chat,
            text="I can't tell who that message came from. Reply to a relayed message.")
         return
 
